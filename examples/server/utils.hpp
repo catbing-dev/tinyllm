@@ -9,8 +9,6 @@
 
 #include "json.hpp"
 
-#include "../llava/clip.h"
-
 using json = nlohmann::json;
 
 extern bool server_verbose;

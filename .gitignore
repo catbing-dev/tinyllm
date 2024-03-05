@@ -72,7 +72,6 @@ models-mnt
 /train-text-from-scratch
 /tokenize
 /vdot
-/common/build-info.cpp
 arm_neon.h
 compile_commands.json
 CMakeSettings.json

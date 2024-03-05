@@ -1,901 +1,612 @@
-# Define the default target now so that it is always the first target
-BUILD_TARGETS = \
-	main quantize quantize-stats perplexity imatrix embedding vdot q8dot train-text-from-scratch convert-llama2c-to-ggml \
-	simple batched batched-bench save-load-state server gguf llama-bench libllava.a llava-cli baby-llama beam-search  \
-	speculative infill tokenize benchmark-matmult parallel finetune export-lora lookahead lookup passkey tests/test-c.o
-
-# Binaries only useful for tests
-TEST_TARGETS = \
-	tests/test-llama-grammar tests/test-grammar-parser tests/test-double-float tests/test-grad0 tests/test-opt \
-	tests/test-quantize-fns tests/test-quantize-perf tests/test-sampling tests/test-tokenizer-0-llama          \
-	tests/test-tokenizer-0-falcon tests/test-tokenizer-1-llama tests/test-tokenizer-1-bpe tests/test-rope      \
-	tests/test-backend-ops tests/test-model-load-cancel tests/test-autorelease
-
-# Code coverage output files
-COV_TARGETS = *.gcno tests/*.gcno *.gcda tests/*.gcda *.gcov tests/*.gcov lcov-report gcovr-report
-
-ifndef UNAME_S
-UNAME_S := $(shell uname -s)
-endif
-
-ifndef UNAME_P
-UNAME_P := $(shell uname -p)
-endif
-
-ifndef UNAME_M
-UNAME_M := $(shell uname -m)
-endif
-
-# Mac OS + Arm can report x86_64
-# ref: https://github.com/ggerganov/whisper.cpp/issues/66#issuecomment-1282546789
-ifeq ($(UNAME_S),Darwin)
-	ifndef LLAMA_NO_METAL
-		LLAMA_METAL := 1
-	endif
-
-	ifneq ($(UNAME_P),arm)
-		SYSCTL_M := $(shell sysctl -n hw.optional.arm64 2>/dev/null)
-		ifeq ($(SYSCTL_M),1)
-			# UNAME_P := arm
-			# UNAME_M := arm64
-			warn := $(warning Your arch is announced as x86_64, but it seems to actually be ARM64. Not fixing that can lead to bad performance. For more info see: https://github.com/ggerganov/whisper.cpp/issues/66\#issuecomment-1282546789)
-		endif
-	endif
-endif
-
-default: $(BUILD_TARGETS)
-
-test: $(TEST_TARGETS)
-	@failures=0; \
-	for test_target in $(TEST_TARGETS); do \
-		if [ "$$test_target" = "tests/test-tokenizer-0-llama" ]; then \
-			./$$test_target $(CURDIR)/models/ggml-vocab-llama.gguf; \
-		elif [ "$$test_target" = "tests/test-tokenizer-0-falcon" ]; then \
-			./$$test_target $(CURDIR)/models/ggml-vocab-falcon.gguf; \
-		elif [ "$$test_target" = "tests/test-tokenizer-1-llama" ]; then \
-			continue; \
-		elif [ "$$test_target" = "tests/test-tokenizer-1-bpe" ]; then \
-			continue; \
-		else \
-			echo "Running test $$test_target..."; \
-			./$$test_target; \
-		fi; \
-		if [ $$? -ne 0 ]; then \
-			printf 'Test %s FAILED!\n\n' $$test_target; \
-			failures=$$(( failures + 1 )); \
-		else \
-			printf 'Test %s passed.\n\n' $$test_target; \
-		fi; \
-	done; \
-	if [ $$failures -gt 0 ]; then \
-		printf '\n%s tests failed.\n' $$failures; \
-		exit 1; \
-	fi
-	@echo 'All tests passed.'
-
-all: $(BUILD_TARGETS) $(TEST_TARGETS)
-
-coverage: ## Run code coverage
-	gcov -pb tests/*.cpp
-
-lcov-report: coverage ## Generate lcov report
-	mkdir -p lcov-report
-	lcov --capture --directory . --output-file lcov-report/coverage.info
-	genhtml lcov-report/coverage.info --output-directory lcov-report
-
-gcovr-report: coverage ## Generate gcovr report
-	mkdir -p gcovr-report
-	gcovr --root . --html --html-details --output gcovr-report/coverage.html
-
-ifdef RISCV_CROSS_COMPILE
-CC	:= riscv64-unknown-linux-gnu-gcc
-CXX	:= riscv64-unknown-linux-gnu-g++
-endif
-
-#
-# Compile flags
-#
-
-# keep standard at C11 and C++11
-MK_CPPFLAGS  = -I. -Icommon
-MK_CFLAGS    = -std=c11   -fPIC
-MK_CXXFLAGS  = -std=c++11 -fPIC
-MK_NVCCFLAGS = -std=c++11
-
-# -Ofast tends to produce faster code, but may not be available for some compilers.
-ifdef LLAMA_FAST
-MK_CFLAGS     += -Ofast
-HOST_CXXFLAGS += -Ofast
-MK_NVCCFLAGS  += -O3
-else
-MK_CFLAGS     += -O3
-MK_CXXFLAGS   += -O3
-MK_NVCCFLAGS  += -O3
-endif
-
-ifndef LLAMA_NO_CCACHE
-CCACHE := $(shell which ccache)
-ifdef CCACHE
-export CCACHE_SLOPPINESS = time_macros
-$(info I ccache found, compilation results will be cached. Disable with LLAMA_NO_CCACHE.)
-CC    := $(CCACHE) $(CC)
-CXX   := $(CCACHE) $(CXX)
-else
-$(info I ccache not found. Consider installing it for faster compilation.)
-endif # CCACHE
-endif # LLAMA_NO_CCACHE
-
-# clock_gettime came in POSIX.1b (1993)
-# CLOCK_MONOTONIC came in POSIX.1-2001 / SUSv3 as optional
-# posix_memalign came in POSIX.1-2001 / SUSv3
-# M_PI is an XSI extension since POSIX.1-2001 / SUSv3, came in XPG1 (1985)
-MK_CPPFLAGS += -D_XOPEN_SOURCE=600
-
-# Somehow in OpenBSD whenever POSIX conformance is specified
-# some string functions rely on locale_t availability,
-# which was introduced in POSIX.1-2008, forcing us to go higher
-ifeq ($(UNAME_S),OpenBSD)
-	MK_CPPFLAGS += -U_XOPEN_SOURCE -D_XOPEN_SOURCE=700
-endif
-
-# Data types, macros and functions related to controlling CPU affinity and
-# some memory allocation are available on Linux through GNU extensions in libc
-ifeq ($(UNAME_S),Linux)
-	MK_CPPFLAGS += -D_GNU_SOURCE
-endif
-
-# RLIMIT_MEMLOCK came in BSD, is not specified in POSIX.1,
-# and on macOS its availability depends on enabling Darwin extensions
-# similarly on DragonFly, enabling BSD extensions is necessary
-ifeq ($(UNAME_S),Darwin)
-	MK_CPPFLAGS += -D_DARWIN_C_SOURCE
-endif
-ifeq ($(UNAME_S),DragonFly)
-	MK_CPPFLAGS += -D__BSD_VISIBLE
-endif
-
-# alloca is a non-standard interface that is not visible on BSDs when
-# POSIX conformance is specified, but not all of them provide a clean way
-# to enable it in such cases
-ifeq ($(UNAME_S),FreeBSD)
-	MK_CPPFLAGS += -D__BSD_VISIBLE
-endif
-ifeq ($(UNAME_S),NetBSD)
-	MK_CPPFLAGS += -D_NETBSD_SOURCE
-endif
-ifeq ($(UNAME_S),OpenBSD)
-	MK_CPPFLAGS += -D_BSD_SOURCE
-endif
-
-ifdef LLAMA_DEBUG
-	MK_CFLAGS   += -O0 -g
-	MK_CXXFLAGS += -O0 -g
-	MK_LDFLAGS  += -g
-
-	ifeq ($(UNAME_S),Linux)
-		MK_CPPFLAGS += -D_GLIBCXX_ASSERTIONS
-	endif
-else
-	MK_CPPFLAGS += -DNDEBUG
-endif
-
-ifdef LLAMA_SANITIZE_THREAD
-	MK_CFLAGS   += -fsanitize=thread -g
-	MK_CXXFLAGS += -fsanitize=thread -g
-	MK_LDFLAGS  += -fsanitize=thread -g
-endif
-
-ifdef LLAMA_SANITIZE_ADDRESS
-	MK_CFLAGS   += -fsanitize=address -fno-omit-frame-pointer -g
-	MK_CXXFLAGS += -fsanitize=address -fno-omit-frame-pointer -g
-	MK_LDFLAGS  += -fsanitize=address -fno-omit-frame-pointer -g
-endif
-
-ifdef LLAMA_SANITIZE_UNDEFINED
-	MK_CFLAGS   += -fsanitize=undefined -g
-	MK_CXXFLAGS += -fsanitize=undefined -g
-	MK_LDFLAGS  += -fsanitize=undefined -g
-endif
-
-ifdef LLAMA_SERVER_VERBOSE
-	MK_CPPFLAGS += -DSERVER_VERBOSE=$(LLAMA_SERVER_VERBOSE)
-endif
-
-
-ifdef LLAMA_CODE_COVERAGE
-	MK_CXXFLAGS += -fprofile-arcs -ftest-coverage -dumpbase ''
-endif
-
-ifdef LLAMA_DISABLE_LOGS
-	MK_CPPFLAGS += -DLOG_DISABLE_LOGS
-endif # LLAMA_DISABLE_LOGS
-
-# warnings
-WARN_FLAGS    = -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function
-MK_CFLAGS    += $(WARN_FLAGS) -Wshadow -Wstrict-prototypes -Wpointer-arith -Wmissing-prototypes -Werror=implicit-int \
-				-Werror=implicit-function-declaration
-MK_CXXFLAGS  += $(WARN_FLAGS) -Wmissing-declarations -Wmissing-noreturn
-
-ifeq ($(LLAMA_FATAL_WARNINGS),1)
-	MK_CFLAGS   += -Werror
-	MK_CXXFLAGS += -Werror
-endif
-
-# this version of Apple ld64 is buggy
-ifneq '' '$(findstring dyld-1015.7,$(shell $(CC) $(LDFLAGS) -Wl,-v 2>&1))'
-	MK_CPPFLAGS += -DHAVE_BUGGY_APPLE_LINKER
-endif
-
-# OS specific
-# TODO: support Windows
-ifneq '' '$(filter $(UNAME_S),Linux Darwin FreeBSD NetBSD OpenBSD Haiku)'
-	MK_CFLAGS   += -pthread
-	MK_CXXFLAGS += -pthread
-endif
-
-# detect Windows
-ifneq ($(findstring _NT,$(UNAME_S)),)
-	_WIN32 := 1
-endif
-
-# library name prefix
-ifneq ($(_WIN32),1)
-	LIB_PRE := lib
-endif
-
-# Dynamic Shared Object extension
-ifneq ($(_WIN32),1)
-	DSO_EXT := .so
-else
-	DSO_EXT := .dll
-endif
-
-# Windows Sockets 2 (Winsock) for network-capable apps
-ifeq ($(_WIN32),1)
-	LWINSOCK2 := -lws2_32
-endif
-
-ifdef LLAMA_GPROF
-	MK_CFLAGS   += -pg
-	MK_CXXFLAGS += -pg
-endif
-ifdef LLAMA_PERF
-	MK_CPPFLAGS += -DGGML_PERF
-endif
-
-# Architecture specific
-# TODO: probably these flags need to be tweaked on some architectures
-#       feel free to update the Makefile for your architecture and send a pull request or issue
-
-ifndef RISCV
-
-ifeq ($(UNAME_M),$(filter $(UNAME_M),x86_64 i686 amd64))
-	# Use all CPU extensions that are available:
-	MK_CFLAGS     += -march=native -mtune=native
-	HOST_CXXFLAGS += -march=native -mtune=native
-
-	# Usage AVX-only
-	#MK_CFLAGS   += -mfma -mf16c -mavx
-	#MK_CXXFLAGS += -mfma -mf16c -mavx
-
-	# Usage SSSE3-only (Not is SSE3!)
-	#MK_CFLAGS   += -mssse3
-	#MK_CXXFLAGS += -mssse3
-endif
-
-ifneq '' '$(findstring mingw,$(shell $(CC) -dumpmachine))'
-	# The stack is only 16-byte aligned on Windows, so don't let gcc emit aligned moves.
-	# https://gcc.gnu.org/bugzilla/show_bug.cgi?id=54412
-	# https://github.com/ggerganov/llama.cpp/issues/2922
-	MK_CFLAGS   += -Xassembler -muse-unaligned-vector-move
-	MK_CXXFLAGS += -Xassembler -muse-unaligned-vector-move
-
-	# Target Windows 8 for PrefetchVirtualMemory
-	MK_CPPFLAGS += -D_WIN32_WINNT=0x602
-endif
-
-ifneq ($(filter aarch64%,$(UNAME_M)),)
-	# Apple M1, M2, etc.
-	# Raspberry Pi 3, 4, Zero 2 (64-bit)
-	# Nvidia Jetson
-	MK_CFLAGS   += -mcpu=native
-	MK_CXXFLAGS += -mcpu=native
-	JETSON_RELEASE_INFO = $(shell jetson_release)
-	ifdef JETSON_RELEASE_INFO
-		ifneq ($(filter TX2%,$(JETSON_RELEASE_INFO)),)
-			JETSON_EOL_MODULE_DETECT = 1
-			CC = aarch64-unknown-linux-gnu-gcc
-			cxx = aarch64-unknown-linux-gnu-g++
-		endif
-	endif
-endif
-
-ifneq ($(filter armv6%,$(UNAME_M)),)
-	# Raspberry Pi 1, Zero
-	MK_CFLAGS   += -mfpu=neon-fp-armv8 -mfp16-format=ieee -mno-unaligned-access
-	MK_CXXFLAGS += -mfpu=neon-fp-armv8 -mfp16-format=ieee -mno-unaligned-access
-endif
-
-ifneq ($(filter armv7%,$(UNAME_M)),)
-	# Raspberry Pi 2
-	MK_CFLAGS   += -mfpu=neon-fp-armv8 -mfp16-format=ieee -mno-unaligned-access -funsafe-math-optimizations
-	MK_CXXFLAGS += -mfpu=neon-fp-armv8 -mfp16-format=ieee -mno-unaligned-access -funsafe-math-optimizations
-endif
-
-ifneq ($(filter armv8%,$(UNAME_M)),)
-	# Raspberry Pi 3, 4, Zero 2 (32-bit)
-	MK_CFLAGS   += -mfp16-format=ieee -mno-unaligned-access
-	MK_CXXFLAGS += -mfp16-format=ieee -mno-unaligned-access
-endif
-
-ifneq ($(filter ppc64%,$(UNAME_M)),)
-	POWER9_M := $(shell grep "POWER9" /proc/cpuinfo)
-	ifneq (,$(findstring POWER9,$(POWER9_M)))
-		MK_CFLAGS   += -mcpu=power9
-		MK_CXXFLAGS += -mcpu=power9
-	endif
-endif
-
-ifneq ($(filter ppc64le%,$(UNAME_M)),)
-	MK_CFLAGS   += -mcpu=powerpc64le
-	MK_CXXFLAGS += -mcpu=powerpc64le
-	CUDA_POWER_ARCH = 1
-endif
-
-else
-	MK_CFLAGS   += -march=rv64gcv -mabi=lp64d
-	MK_CXXFLAGS += -march=rv64gcv -mabi=lp64d
-endif
-
-ifdef LLAMA_QKK_64
-	MK_CPPFLAGS += -DGGML_QKK_64
-endif
-
-ifndef LLAMA_NO_ACCELERATE
-	# Mac OS - include Accelerate framework.
-	# `-framework Accelerate` works both with Apple Silicon and Mac Intel
-	ifeq ($(UNAME_S),Darwin)
-		MK_CPPFLAGS += -DGGML_USE_ACCELERATE
-		MK_CPPFLAGS += -DACCELERATE_NEW_LAPACK
-		MK_CPPFLAGS += -DACCELERATE_LAPACK_ILP64
-		MK_LDFLAGS  += -framework Accelerate
-	endif
-endif # LLAMA_NO_ACCELERATE
-
-ifdef LLAMA_MPI
-	MK_CPPFLAGS += -DGGML_USE_MPI
-	MK_CFLAGS   += -Wno-cast-qual
-	MK_CXXFLAGS += -Wno-cast-qual
-	OBJS        += ggml-mpi.o
-endif # LLAMA_MPI
-
-ifdef LLAMA_OPENBLAS
-	MK_CPPFLAGS += -DGGML_USE_OPENBLAS $(shell pkg-config --cflags-only-I openblas)
-	MK_CFLAGS   += $(shell pkg-config --cflags-only-other openblas)
-	MK_LDFLAGS  += $(shell pkg-config --libs openblas)
-endif # LLAMA_OPENBLAS
-
-ifdef LLAMA_BLIS
-	MK_CPPFLAGS += -DGGML_USE_OPENBLAS -I/usr/local/include/blis -I/usr/include/blis
-	MK_LDFLAGS  += -lblis -L/usr/local/lib
-endif # LLAMA_BLIS
-
-ifdef LLAMA_CUBLAS
-	ifneq ('', '$(wildcard /opt/cuda)')
-		CUDA_PATH ?= /opt/cuda
-	else
-		CUDA_PATH ?= /usr/local/cuda
-	endif
-	MK_CPPFLAGS  += -DGGML_USE_CUBLAS -I$(CUDA_PATH)/include -I$(CUDA_PATH)/targets/$(UNAME_M)-linux/include
-	MK_LDFLAGS   += -lcuda -lcublas -lculibos -lcudart -lcublasLt -lpthread -ldl -lrt -L$(CUDA_PATH)/lib64 -L/usr/lib64 -L$(CUDA_PATH)/targets/$(UNAME_M)-linux/lib -L/usr/lib/wsl/lib
-	OBJS         += ggml-cuda.o
-	MK_NVCCFLAGS += -use_fast_math
-ifdef LLAMA_FATAL_WARNINGS
-	MK_NVCCFLAGS += -Werror all-warnings
-endif # LLAMA_FATAL_WARNINGS
-ifndef JETSON_EOL_MODULE_DETECT
-	MK_NVCCFLAGS += --forward-unknown-to-host-compiler
-endif # JETSON_EOL_MODULE_DETECT
-ifdef LLAMA_DEBUG
-	MK_NVCCFLAGS += -lineinfo
-endif # LLAMA_DEBUG
-ifdef LLAMA_CUDA_NVCC
-	NVCC = $(CCACHE) $(LLAMA_CUDA_NVCC)
-else
-	NVCC = $(CCACHE) nvcc
-endif #LLAMA_CUDA_NVCC
-ifdef CUDA_DOCKER_ARCH
-	MK_NVCCFLAGS += -Wno-deprecated-gpu-targets -arch=$(CUDA_DOCKER_ARCH)
-else ifndef CUDA_POWER_ARCH
-	MK_NVCCFLAGS += -arch=native
-endif # CUDA_DOCKER_ARCH
-ifdef LLAMA_CUDA_FORCE_DMMV
-	MK_NVCCFLAGS += -DGGML_CUDA_FORCE_DMMV
-endif # LLAMA_CUDA_FORCE_DMMV
-ifdef LLAMA_CUDA_FORCE_MMQ
-	MK_NVCCFLAGS += -DGGML_CUDA_FORCE_MMQ
-endif # LLAMA_CUDA_FORCE_MMQ
-ifdef LLAMA_CUDA_DMMV_X
-	MK_NVCCFLAGS += -DGGML_CUDA_DMMV_X=$(LLAMA_CUDA_DMMV_X)
-else
-	MK_NVCCFLAGS += -DGGML_CUDA_DMMV_X=32
-endif # LLAMA_CUDA_DMMV_X
-ifdef LLAMA_CUDA_MMV_Y
-	MK_NVCCFLAGS += -DGGML_CUDA_MMV_Y=$(LLAMA_CUDA_MMV_Y)
-else ifdef LLAMA_CUDA_DMMV_Y
-	MK_NVCCFLAGS += -DGGML_CUDA_MMV_Y=$(LLAMA_CUDA_DMMV_Y) # for backwards compatibility
-else
-	MK_NVCCFLAGS += -DGGML_CUDA_MMV_Y=1
-endif # LLAMA_CUDA_MMV_Y
-ifdef LLAMA_CUDA_F16
-	MK_NVCCFLAGS += -DGGML_CUDA_F16
-endif # LLAMA_CUDA_F16
-ifdef LLAMA_CUDA_DMMV_F16
-	MK_NVCCFLAGS += -DGGML_CUDA_F16
-endif # LLAMA_CUDA_DMMV_F16
-ifdef LLAMA_CUDA_KQUANTS_ITER
-	MK_NVCCFLAGS += -DK_QUANTS_PER_ITERATION=$(LLAMA_CUDA_KQUANTS_ITER)
-else
-	MK_NVCCFLAGS += -DK_QUANTS_PER_ITERATION=2
-endif
-ifdef LLAMA_CUDA_PEER_MAX_BATCH_SIZE
-	MK_NVCCFLAGS += -DGGML_CUDA_PEER_MAX_BATCH_SIZE=$(LLAMA_CUDA_PEER_MAX_BATCH_SIZE)
-else
-	MK_NVCCFLAGS += -DGGML_CUDA_PEER_MAX_BATCH_SIZE=128
-endif # LLAMA_CUDA_PEER_MAX_BATCH_SIZE
-#ifdef LLAMA_CUDA_CUBLAS
-#	MK_NVCCFLAGS += -DGGML_CUDA_CUBLAS
-#endif # LLAMA_CUDA_CUBLAS
-ifdef LLAMA_CUDA_CCBIN
-	MK_NVCCFLAGS += -ccbin $(LLAMA_CUDA_CCBIN)
-endif
-ggml-cuda.o: ggml-cuda.cu ggml-cuda.h
-ifdef JETSON_EOL_MODULE_DETECT
-	$(NVCC) -I. -Icommon -D_XOPEN_SOURCE=600 -D_GNU_SOURCE -DNDEBUG -DGGML_USE_CUBLAS -I/usr/local/cuda/include -I/opt/cuda/include -I/usr/local/cuda/targets/aarch64-linux/include -std=c++11 -O3 $(NVCCFLAGS) $(CPPFLAGS) -Xcompiler "$(CUDA_CXXFLAGS)" -c $< -o $@
-else
-	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) -Xcompiler "$(CUDA_CXXFLAGS)" -c $< -o $@
-endif # JETSON_EOL_MODULE_DETECT
-endif # LLAMA_CUBLAS
-
-ifdef LLAMA_CLBLAST
-
-	MK_CPPFLAGS += -DGGML_USE_CLBLAST $(shell pkg-config --cflags-only-I clblast OpenCL)
-	MK_CFLAGS   += $(shell pkg-config --cflags-only-other clblast OpenCL)
-	MK_CXXFLAGS += $(shell pkg-config --cflags-only-other clblast OpenCL)
-
-	# Mac provides OpenCL as a framework
-	ifeq ($(UNAME_S),Darwin)
-		MK_LDFLAGS += -lclblast -framework OpenCL
-	else
-		MK_LDFLAGS += $(shell pkg-config --libs clblast OpenCL)
-	endif
-	OBJS    += ggml-opencl.o
-
-ggml-opencl.o: ggml-opencl.cpp ggml-opencl.h
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-endif # LLAMA_CLBLAST
-
-ifdef LLAMA_VULKAN
-	MK_CPPFLAGS  += -DGGML_USE_VULKAN
-	MK_LDFLAGS += -lvulkan
-	OBJS    += ggml-vulkan.o
-
-ifdef LLAMA_VULKAN_CHECK_RESULTS
-	MK_CPPFLAGS  += -DGGML_VULKAN_CHECK_RESULTS
-endif
-
-ifdef LLAMA_VULKAN_DEBUG
-	MK_CPPFLAGS  += -DGGML_VULKAN_DEBUG
-endif
-
-ifdef LLAMA_VULKAN_VALIDATE
-	MK_CPPFLAGS  += -DGGML_VULKAN_VALIDATE
-endif
-
-ifdef LLAMA_VULKAN_RUN_TESTS
-	MK_CPPFLAGS  += -DGGML_VULKAN_RUN_TESTS
-endif
-
-ggml-vulkan.o: ggml-vulkan.cpp ggml-vulkan.h
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-endif # LLAMA_VULKAN
-
-ifdef LLAMA_HIPBLAS
-
-	ifeq ($(wildcard /opt/rocm),)
-		ROCM_PATH	?= /usr
-		GPU_TARGETS ?= $(shell $(shell which amdgpu-arch))
-	else
-		ROCM_PATH	?= /opt/rocm
-		GPU_TARGETS ?= $(shell $(ROCM_PATH)/llvm/bin/amdgpu-arch)
-	endif
-	HIPCC                   ?= $(CCACHE) $(ROCM_PATH)/bin/hipcc
-	LLAMA_CUDA_DMMV_X       ?= 32
-	LLAMA_CUDA_MMV_Y        ?= 1
-	LLAMA_CUDA_KQUANTS_ITER ?= 2
-	MK_CPPFLAGS += -DGGML_USE_HIPBLAS -DGGML_USE_CUBLAS
-ifdef LLAMA_HIP_UMA
-	MK_CPPFLAGS += -DGGML_HIP_UMA
-endif # LLAMA_HIP_UMA
-	MK_LDFLAGS  += -L$(ROCM_PATH)/lib -Wl,-rpath=$(ROCM_PATH)/lib
-	MK_LDFLAGS	+= -lhipblas -lamdhip64 -lrocblas
-	HIPFLAGS    += $(addprefix --offload-arch=,$(GPU_TARGETS))
-	HIPFLAGS    += -DGGML_CUDA_DMMV_X=$(LLAMA_CUDA_DMMV_X)
-	HIPFLAGS    += -DGGML_CUDA_MMV_Y=$(LLAMA_CUDA_MMV_Y)
-	HIPFLAGS    += -DK_QUANTS_PER_ITERATION=$(LLAMA_CUDA_KQUANTS_ITER)
-ifdef LLAMA_CUDA_FORCE_DMMV
-	HIPFLAGS 	+= -DGGML_CUDA_FORCE_DMMV
-endif # LLAMA_CUDA_FORCE_DMMV
-	OBJS        += ggml-cuda.o
-ggml-cuda.o: ggml-cuda.cu ggml-cuda.h
-	$(HIPCC) $(CXXFLAGS) $(HIPFLAGS) -x hip -c -o $@ $<
-endif # LLAMA_HIPBLAS
-
-ifdef LLAMA_METAL
-	MK_CPPFLAGS += -DGGML_USE_METAL
-	MK_LDFLAGS  += -framework Foundation -framework Metal -framework MetalKit
-	OBJS		+= ggml-metal.o
-ifdef LLAMA_METAL_NDEBUG
-	MK_CPPFLAGS += -DGGML_METAL_NDEBUG
-endif
-ifdef LLAMA_METAL_EMBED_LIBRARY
-	MK_CPPFLAGS += -DGGML_METAL_EMBED_LIBRARY
-	OBJS        += ggml-metal-embed.o
-endif
-endif # LLAMA_METAL
-
-ifdef LLAMA_METAL
-ggml-metal.o: ggml-metal.m ggml-metal.h
-	$(CC) $(CFLAGS) -c $< -o $@
-
-ifdef LLAMA_METAL_EMBED_LIBRARY
-ggml-metal-embed.o: ggml-metal.metal
-	@echo "Embedding Metal library"
-	$(eval TEMP_ASSEMBLY=$(shell mktemp))
-	@echo ".section __DATA, __ggml_metallib" > $(TEMP_ASSEMBLY)
-	@echo ".globl _ggml_metallib_start" >> $(TEMP_ASSEMBLY)
-	@echo "_ggml_metallib_start:" >> $(TEMP_ASSEMBLY)
-	@echo ".incbin \"$<\"" >> $(TEMP_ASSEMBLY)
-	@echo ".globl _ggml_metallib_end" >> $(TEMP_ASSEMBLY)
-	@echo "_ggml_metallib_end:" >> $(TEMP_ASSEMBLY)
-	@$(AS) $(TEMP_ASSEMBLY) -o $@
-	@rm -f ${TEMP_ASSEMBLY}
-endif
-endif # LLAMA_METAL
-
-ifdef LLAMA_MPI
-ggml-mpi.o: ggml-mpi.c ggml-mpi.h
-	$(CC) $(CFLAGS) -c $< -o $@
-endif # LLAMA_MPI
-
-GF_CC := $(CC)
-include scripts/get-flags.mk
-
-# combine build flags with cmdline overrides
-override CPPFLAGS  := $(MK_CPPFLAGS) $(CPPFLAGS)
-override CFLAGS    := $(CPPFLAGS) $(MK_CFLAGS) $(GF_CFLAGS) $(CFLAGS)
-BASE_CXXFLAGS      := $(MK_CXXFLAGS) $(CXXFLAGS)
-override CXXFLAGS  := $(BASE_CXXFLAGS) $(HOST_CXXFLAGS) $(GF_CXXFLAGS) $(CPPFLAGS)
-override NVCCFLAGS := $(MK_NVCCFLAGS) $(NVCCFLAGS)
-override LDFLAGS   := $(MK_LDFLAGS) $(LDFLAGS)
-
-# identify CUDA host compiler
-ifdef LLAMA_CUBLAS
-GF_CC := $(NVCC) $(NVCCFLAGS) 2>/dev/null .c -Xcompiler
-include scripts/get-flags.mk
-CUDA_CXXFLAGS := $(BASE_CXXFLAGS) $(GF_CXXFLAGS) -Wno-pedantic
-endif
-
-#
-# Print build information
-#
-
-$(info I llama.cpp build info: )
-$(info I UNAME_S:   $(UNAME_S))
-$(info I UNAME_P:   $(UNAME_P))
-$(info I UNAME_M:   $(UNAME_M))
-$(info I CFLAGS:    $(CFLAGS))
-$(info I CXXFLAGS:  $(CXXFLAGS))
-$(info I NVCCFLAGS: $(NVCCFLAGS))
-$(info I LDFLAGS:   $(LDFLAGS))
-$(info I CC:        $(shell $(CC)   --version | head -n 1))
-$(info I CXX:       $(shell $(CXX)  --version | head -n 1))
-ifdef LLAMA_CUBLAS
-$(info I NVCC:      $(shell $(NVCC) --version | tail -n 1))
-CUDA_VERSION := $(shell $(NVCC) --version | grep -oP 'release (\K[0-9]+\.[0-9])')
-ifeq ($(shell awk -v "v=$(CUDA_VERSION)" 'BEGIN { print (v < 11.7) }'),1)
-ifndef CUDA_DOCKER_ARCH
-ifndef CUDA_POWER_ARCH
-$(error I ERROR: For CUDA versions < 11.7 a target CUDA architecture must be explicitly provided via CUDA_DOCKER_ARCH)
-endif # CUDA_POWER_ARCH
-endif # CUDA_DOCKER_ARCH
-endif # eq ($(shell echo "$(CUDA_VERSION) < 11.7" | bc),1)
-endif # LLAMA_CUBLAS
-$(info )
-
-#
-# Build library
-#
-
-ggml.o: ggml.c ggml.h ggml-cuda.h
-	$(CC)  $(CFLAGS)   -c $< -o $@
-
-ggml-alloc.o: ggml-alloc.c ggml.h ggml-alloc.h
-	$(CC)  $(CFLAGS)   -c $< -o $@
-
-ggml-backend.o: ggml-backend.c ggml.h ggml-backend.h
-	$(CC)  $(CFLAGS)   -c $< -o $@
-
-ggml-quants.o: ggml-quants.c ggml.h ggml-quants.h
-	$(CC) $(CFLAGS)    -c $< -o $@
-
-OBJS += ggml-alloc.o ggml-backend.o ggml-quants.o
-
-llama.o: llama.cpp ggml.h ggml-alloc.h ggml-backend.h ggml-cuda.h ggml-metal.h llama.h
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-COMMON_H_DEPS = common/common.h common/sampling.h common/log.h
-COMMON_DEPS   = common.o sampling.o grammar-parser.o build-info.o
-
-common.o: common/common.cpp $(COMMON_H_DEPS)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-sampling.o: common/sampling.cpp $(COMMON_H_DEPS)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-console.o: common/console.cpp common/console.h
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-grammar-parser.o: common/grammar-parser.cpp common/grammar-parser.h
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-train.o: common/train.cpp common/train.h
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-libllama.so: llama.o ggml.o $(OBJS)
-	$(CXX) $(CXXFLAGS) -shared -fPIC -o $@ $^ $(LDFLAGS)
-
-libllama.a: llama.o ggml.o $(OBJS) $(COMMON_DEPS)
-	ar rcs libllama.a llama.o ggml.o $(OBJS) $(COMMON_DEPS)
+# CMAKE generated file: DO NOT EDIT!
+# Generated by "Unix Makefiles" Generator, CMake Version 3.28
 
+# Default target executed when no arguments are given to make.
+default_target: all
+.PHONY : default_target
+
+# Allow only one "make -f Makefile2" at a time, but pass parallelism.
+.NOTPARALLEL:
+
+#=============================================================================
+# Special targets provided by cmake.
+
+# Disable implicit rules so canonical targets will work.
+.SUFFIXES:
+
+# Disable VCS-based implicit rules.
+% : %,v
+
+# Disable VCS-based implicit rules.
+% : RCS/%
+
+# Disable VCS-based implicit rules.
+% : RCS/%,v
+
+# Disable VCS-based implicit rules.
+% : SCCS/s.%
+
+# Disable VCS-based implicit rules.
+% : s.%
+
+.SUFFIXES: .hpux_make_needs_suffix_list
+
+# Command-line flag to silence nested $(MAKE).
+$(VERBOSE)MAKESILENT = -s
+
+#Suppress display of executed commands.
+$(VERBOSE).SILENT:
+
+# A target that is always out of date.
+cmake_force:
+.PHONY : cmake_force
+
+#=============================================================================
+# Set environment variables for the build.
+
+# The shell in which to execute make rules.
+SHELL = /bin/sh
+
+# The CMake executable.
+CMAKE_COMMAND = /usr/bin/cmake
+
+# The command to remove a file.
+RM = /usr/bin/cmake -E rm -f
+
+# Escaping for special characters.
+EQUALS = =
+
+# The top-level source directory on which CMake was run.
+CMAKE_SOURCE_DIR = /data/Code/Project/catbing_chat/tinyllm
+
+# The top-level build directory on which CMake was run.
+CMAKE_BINARY_DIR = /data/Code/Project/catbing_chat/tinyllm
+
+#=============================================================================
+# Targets provided globally by CMake.
+
+# Special rule for the target edit_cache
+edit_cache:
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --cyan "Running CMake cache editor..."
+	/usr/bin/ccmake -S$(CMAKE_SOURCE_DIR) -B$(CMAKE_BINARY_DIR)
+.PHONY : edit_cache
+
+# Special rule for the target edit_cache
+edit_cache/fast: edit_cache
+.PHONY : edit_cache/fast
+
+# Special rule for the target rebuild_cache
+rebuild_cache:
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --cyan "Running CMake to regenerate build system..."
+	/usr/bin/cmake --regenerate-during-build -S$(CMAKE_SOURCE_DIR) -B$(CMAKE_BINARY_DIR)
+.PHONY : rebuild_cache
+
+# Special rule for the target rebuild_cache
+rebuild_cache/fast: rebuild_cache
+.PHONY : rebuild_cache/fast
+
+# Special rule for the target list_install_components
+list_install_components:
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --cyan "Available install components are: \"Unspecified\""
+.PHONY : list_install_components
+
+# Special rule for the target list_install_components
+list_install_components/fast: list_install_components
+.PHONY : list_install_components/fast
+
+# Special rule for the target install
+install: preinstall
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --cyan "Install the project..."
+	/usr/bin/cmake -P cmake_install.cmake
+.PHONY : install
+
+# Special rule for the target install
+install/fast: preinstall/fast
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --cyan "Install the project..."
+	/usr/bin/cmake -P cmake_install.cmake
+.PHONY : install/fast
+
+# Special rule for the target install/local
+install/local: preinstall
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --cyan "Installing only the local directory..."
+	/usr/bin/cmake -DCMAKE_INSTALL_LOCAL_ONLY=1 -P cmake_install.cmake
+.PHONY : install/local
+
+# Special rule for the target install/local
+install/local/fast: preinstall/fast
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --cyan "Installing only the local directory..."
+	/usr/bin/cmake -DCMAKE_INSTALL_LOCAL_ONLY=1 -P cmake_install.cmake
+.PHONY : install/local/fast
+
+# Special rule for the target install/strip
+install/strip: preinstall
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --cyan "Installing the project stripped..."
+	/usr/bin/cmake -DCMAKE_INSTALL_DO_STRIP=1 -P cmake_install.cmake
+.PHONY : install/strip
+
+# Special rule for the target install/strip
+install/strip/fast: preinstall/fast
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --cyan "Installing the project stripped..."
+	/usr/bin/cmake -DCMAKE_INSTALL_DO_STRIP=1 -P cmake_install.cmake
+.PHONY : install/strip/fast
+
+# The main all target
+all: cmake_check_build_system
+	$(CMAKE_COMMAND) -E cmake_progress_start /data/Code/Project/catbing_chat/tinyllm/CMakeFiles /data/Code/Project/catbing_chat/tinyllm//CMakeFiles/progress.marks
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 all
+	$(CMAKE_COMMAND) -E cmake_progress_start /data/Code/Project/catbing_chat/tinyllm/CMakeFiles 0
+.PHONY : all
+
+# The main clean target
 clean:
-	rm -vrf *.o tests/*.o *.so *.a *.dll benchmark-matmult common/build-info.cpp *.dot $(COV_TARGETS) $(BUILD_TARGETS) $(TEST_TARGETS)
-	find examples pocs -type f -name "*.o" -delete
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 clean
+.PHONY : clean
 
-#
-# Examples
-#
+# The main clean target
+clean/fast: clean
+.PHONY : clean/fast
 
-# $< is the first prerequisite, i.e. the source file.
-# Explicitly compile this to an object file so that it can be cached with ccache.
-# The source file is then filtered out from $^ (the list of all prerequisites) and the object file is added instead.
+# Prepare targets for installation.
+preinstall: all
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 preinstall
+.PHONY : preinstall
 
-# Helper function that replaces .c, .cpp, and .cu file endings with .o:
-GET_OBJ_FILE = $(patsubst %.c,%.o,$(patsubst %.cpp,%.o,$(patsubst %.cu,%.o,$(1))))
+# Prepare targets for installation.
+preinstall/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 preinstall
+.PHONY : preinstall/fast
 
-main: examples/main/main.cpp                                  ggml.o llama.o $(COMMON_DEPS) console.o grammar-parser.o $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
-	@echo
-	@echo '====  Run ./main -h for help.  ===='
-	@echo
+# clear depends
+depend:
+	$(CMAKE_COMMAND) -S$(CMAKE_SOURCE_DIR) -B$(CMAKE_BINARY_DIR) --check-build-system CMakeFiles/Makefile.cmake 1
+.PHONY : depend
 
-infill: examples/infill/infill.cpp                            ggml.o llama.o $(COMMON_DEPS) console.o grammar-parser.o $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+#=============================================================================
+# Target rules for targets named ggml
 
-simple: examples/simple/simple.cpp                            ggml.o llama.o $(COMMON_DEPS) $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+# Build rule for target.
+ggml: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 ggml
+.PHONY : ggml
 
-tokenize: examples/tokenize/tokenize.cpp                      ggml.o llama.o $(COMMON_DEPS) $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+# fast build rule for target.
+ggml/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/ggml.dir/build.make CMakeFiles/ggml.dir/build
+.PHONY : ggml/fast
 
-batched: examples/batched/batched.cpp                         ggml.o llama.o $(COMMON_DEPS) $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+#=============================================================================
+# Target rules for targets named ggml_static
 
-batched-bench: examples/batched-bench/batched-bench.cpp       build-info.o ggml.o llama.o common.o $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+# Build rule for target.
+ggml_static: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 ggml_static
+.PHONY : ggml_static
 
-quantize: examples/quantize/quantize.cpp                      build-info.o ggml.o llama.o $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+# fast build rule for target.
+ggml_static/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/ggml_static.dir/build.make CMakeFiles/ggml_static.dir/build
+.PHONY : ggml_static/fast
 
-quantize-stats: examples/quantize-stats/quantize-stats.cpp    build-info.o ggml.o llama.o $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+#=============================================================================
+# Target rules for targets named ggml_shared
 
-perplexity: examples/perplexity/perplexity.cpp                ggml.o llama.o $(COMMON_DEPS) $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+# Build rule for target.
+ggml_shared: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 ggml_shared
+.PHONY : ggml_shared
 
-imatrix: examples/imatrix/imatrix.cpp                         ggml.o llama.o $(COMMON_DEPS) $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+# fast build rule for target.
+ggml_shared/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/ggml_shared.dir/build.make CMakeFiles/ggml_shared.dir/build
+.PHONY : ggml_shared/fast
 
-embedding: examples/embedding/embedding.cpp                   ggml.o llama.o $(COMMON_DEPS) $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+#=============================================================================
+# Target rules for targets named llama
 
-save-load-state: examples/save-load-state/save-load-state.cpp ggml.o llama.o $(COMMON_DEPS) $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+# Build rule for target.
+llama: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 llama
+.PHONY : llama
 
-server: examples/server/server.cpp examples/server/oai.hpp examples/server/utils.hpp examples/server/httplib.h examples/server/json.hpp examples/server/index.html.hpp examples/server/index.js.hpp examples/server/completion.js.hpp examples/llava/clip.cpp examples/llava/clip.h examples/llava/llava.h examples/llava/llava.cpp common/stb_image.h ggml.o llama.o $(COMMON_DEPS) grammar-parser.o $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) -c examples/llava/clip.cpp -o $(call GET_OBJ_FILE, examples/llava/clip.cpp) -Wno-cast-qual
-	$(CXX) $(CXXFLAGS) -Iexamples/server $(filter-out %.h %.hpp $< examples/llava/clip.cpp,$^) $(call GET_OBJ_FILE, $<) $(call GET_OBJ_FILE, examples/llava/clip.cpp) -o $@ $(LDFLAGS) $(LWINSOCK2)
+# fast build rule for target.
+llama/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/llama.dir/build.make CMakeFiles/llama.dir/build
+.PHONY : llama/fast
 
-gguf: examples/gguf/gguf.cpp ggml.o $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+#=============================================================================
+# Target rules for targets named llama_static
 
-train-text-from-scratch: examples/train-text-from-scratch/train-text-from-scratch.cpp ggml.o llama.o $(COMMON_DEPS) train.o $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+# Build rule for target.
+llama_static: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 llama_static
+.PHONY : llama_static
 
-convert-llama2c-to-ggml: examples/convert-llama2c-to-ggml/convert-llama2c-to-ggml.cpp ggml.o llama.o $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+# fast build rule for target.
+llama_static/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/llama_static.dir/build.make CMakeFiles/llama_static.dir/build
+.PHONY : llama_static/fast
 
-llama-bench: examples/llama-bench/llama-bench.cpp ggml.o llama.o $(COMMON_DEPS) $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+#=============================================================================
+# Target rules for targets named llama_shared
 
-libllava.a: examples/llava/llava.cpp examples/llava/llava.h examples/llava/clip.cpp examples/llava/clip.h common/stb_image.h common/base64.hpp ggml.o llama.o $(COMMON_DEPS) $(OBJS)
-	$(CXX) $(CXXFLAGS) -static -fPIC -c $< -o $@ -Wno-cast-qual
+# Build rule for target.
+llama_shared: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 llama_shared
+.PHONY : llama_shared
 
-llava-cli: examples/llava/llava-cli.cpp examples/llava/clip.h examples/llava/clip.cpp examples/llava/llava.h examples/llava/llava.cpp ggml.o llama.o $(COMMON_DEPS) $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) -c examples/llava/clip.cpp  -o $(call GET_OBJ_FILE, examples/llava/clip.cpp) -Wno-cast-qual
-	$(CXX) $(CXXFLAGS) -c examples/llava/llava.cpp -o $(call GET_OBJ_FILE, examples/llava/llava.cpp)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $< examples/llava/clip.cpp examples/llava/llava.cpp,$^) $(call GET_OBJ_FILE, $<) $(call GET_OBJ_FILE, examples/llava/clip.cpp) $(call GET_OBJ_FILE, examples/llava/llava.cpp) -o $@ $(LDFLAGS)
+# fast build rule for target.
+llama_shared/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/llama_shared.dir/build.make CMakeFiles/llama_shared.dir/build
+.PHONY : llama_shared/fast
 
-baby-llama: examples/baby-llama/baby-llama.cpp ggml.o llama.o $(COMMON_DEPS) train.o $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+#=============================================================================
+# Target rules for targets named common
 
-beam-search: examples/beam-search/beam-search.cpp ggml.o llama.o $(COMMON_DEPS) $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+# Build rule for target.
+common: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 common
+.PHONY : common
 
-finetune: examples/finetune/finetune.cpp ggml.o llama.o $(COMMON_DEPS) train.o $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+# fast build rule for target.
+common/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/common.dir/build.make CMakeFiles/common.dir/build
+.PHONY : common/fast
 
-export-lora: examples/export-lora/export-lora.cpp ggml.o common/common.h $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+#=============================================================================
+# Target rules for targets named server
 
-speculative: examples/speculative/speculative.cpp ggml.o llama.o $(COMMON_DEPS) grammar-parser.o $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+# Build rule for target.
+server: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 server
+.PHONY : server
 
-parallel: examples/parallel/parallel.cpp ggml.o llama.o $(COMMON_DEPS) $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+# fast build rule for target.
+server/fast:
+	$(MAKE) $(MAKESILENT) -f examples/server/CMakeFiles/server.dir/build.make examples/server/CMakeFiles/server.dir/build
+.PHONY : server/fast
 
-lookahead: examples/lookahead/lookahead.cpp ggml.o llama.o $(COMMON_DEPS) $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+#=============================================================================
+# Target rules for targets named binding
 
-lookup: examples/lookup/lookup.cpp ggml.o llama.o $(COMMON_DEPS) $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+# Build rule for target.
+binding: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 binding
+.PHONY : binding
 
-passkey: examples/passkey/passkey.cpp ggml.o llama.o $(COMMON_DEPS) $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+# fast build rule for target.
+binding/fast:
+	$(MAKE) $(MAKESILENT) -f examples/binding/CMakeFiles/binding.dir/build.make examples/binding/CMakeFiles/binding.dir/build
+.PHONY : binding/fast
 
-ifeq ($(UNAME_S),Darwin)
-swift: examples/batched.swift
-	(cd examples/batched.swift; make build)
-endif
+src/common/common.o: src/common/common.cpp.o
+.PHONY : src/common/common.o
 
-common/build-info.cpp: $(wildcard .git/index) scripts/build-info.sh
-	@sh scripts/build-info.sh "$(CC)" > $@.tmp
-	@if ! cmp -s $@.tmp $@; then \
-		mv $@.tmp $@; \
-	else \
-		rm $@.tmp; \
-	fi
+# target to build an object file
+src/common/common.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/common.dir/build.make CMakeFiles/common.dir/src/common/common.cpp.o
+.PHONY : src/common/common.cpp.o
 
-build-info.o: common/build-info.cpp
-	$(CXX) $(CXXFLAGS) -c $(filter-out %.h,$^) -o $@
+src/common/common.i: src/common/common.cpp.i
+.PHONY : src/common/common.i
 
-#
-# Tests
-#
+# target to preprocess a source file
+src/common/common.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/common.dir/build.make CMakeFiles/common.dir/src/common/common.cpp.i
+.PHONY : src/common/common.cpp.i
 
-tests: $(TEST_TARGETS)
+src/common/common.s: src/common/common.cpp.s
+.PHONY : src/common/common.s
 
-benchmark-matmult: examples/benchmark/benchmark-matmult.cpp build-info.o ggml.o $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+# target to generate assembly for a file
+src/common/common.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/common.dir/build.make CMakeFiles/common.dir/src/common/common.cpp.s
+.PHONY : src/common/common.cpp.s
 
-run-benchmark-matmult: benchmark-matmult
-	./$@
+src/common/console.o: src/common/console.cpp.o
+.PHONY : src/common/console.o
 
-.PHONY: run-benchmark-matmult swift
+# target to build an object file
+src/common/console.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/common.dir/build.make CMakeFiles/common.dir/src/common/console.cpp.o
+.PHONY : src/common/console.cpp.o
 
-vdot: pocs/vdot/vdot.cpp ggml.o $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+src/common/console.i: src/common/console.cpp.i
+.PHONY : src/common/console.i
 
-q8dot: pocs/vdot/q8dot.cpp ggml.o $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+# target to preprocess a source file
+src/common/console.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/common.dir/build.make CMakeFiles/common.dir/src/common/console.cpp.i
+.PHONY : src/common/console.cpp.i
 
-tests/test-llama-grammar: tests/test-llama-grammar.cpp ggml.o grammar-parser.o $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+src/common/console.s: src/common/console.cpp.s
+.PHONY : src/common/console.s
 
-tests/test-grammar-parser: tests/test-grammar-parser.cpp ggml.o llama.o grammar-parser.o $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+# target to generate assembly for a file
+src/common/console.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/common.dir/build.make CMakeFiles/common.dir/src/common/console.cpp.s
+.PHONY : src/common/console.cpp.s
 
-tests/test-double-float: tests/test-double-float.cpp ggml.o $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+src/common/grammar-parser.o: src/common/grammar-parser.cpp.o
+.PHONY : src/common/grammar-parser.o
 
-tests/test-grad0: tests/test-grad0.cpp ggml.o $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+# target to build an object file
+src/common/grammar-parser.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/common.dir/build.make CMakeFiles/common.dir/src/common/grammar-parser.cpp.o
+.PHONY : src/common/grammar-parser.cpp.o
 
-tests/test-opt: tests/test-opt.cpp ggml.o $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+src/common/grammar-parser.i: src/common/grammar-parser.cpp.i
+.PHONY : src/common/grammar-parser.i
 
-tests/test-quantize-fns: tests/test-quantize-fns.cpp ggml.o $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+# target to preprocess a source file
+src/common/grammar-parser.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/common.dir/build.make CMakeFiles/common.dir/src/common/grammar-parser.cpp.i
+.PHONY : src/common/grammar-parser.cpp.i
 
-tests/test-quantize-perf: tests/test-quantize-perf.cpp ggml.o $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+src/common/grammar-parser.s: src/common/grammar-parser.cpp.s
+.PHONY : src/common/grammar-parser.s
 
-tests/test-sampling: tests/test-sampling.cpp ggml.o llama.o $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+# target to generate assembly for a file
+src/common/grammar-parser.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/common.dir/build.make CMakeFiles/common.dir/src/common/grammar-parser.cpp.s
+.PHONY : src/common/grammar-parser.cpp.s
 
-tests/test-tokenizer-0-falcon: tests/test-tokenizer-0-falcon.cpp ggml.o llama.o $(COMMON_DEPS) console.o $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+src/common/sampling.o: src/common/sampling.cpp.o
+.PHONY : src/common/sampling.o
 
-tests/test-tokenizer-0-llama: tests/test-tokenizer-0-llama.cpp ggml.o llama.o $(COMMON_DEPS) console.o $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+# target to build an object file
+src/common/sampling.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/common.dir/build.make CMakeFiles/common.dir/src/common/sampling.cpp.o
+.PHONY : src/common/sampling.cpp.o
 
-tests/test-tokenizer-1-bpe: tests/test-tokenizer-1-bpe.cpp ggml.o llama.o $(COMMON_DEPS) console.o $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+src/common/sampling.i: src/common/sampling.cpp.i
+.PHONY : src/common/sampling.i
 
-tests/test-tokenizer-1-llama: tests/test-tokenizer-1-llama.cpp ggml.o llama.o $(COMMON_DEPS) console.o $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+# target to preprocess a source file
+src/common/sampling.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/common.dir/build.make CMakeFiles/common.dir/src/common/sampling.cpp.i
+.PHONY : src/common/sampling.cpp.i
 
-tests/test-rope: tests/test-rope.cpp ggml.o $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+src/common/sampling.s: src/common/sampling.cpp.s
+.PHONY : src/common/sampling.s
 
-tests/test-c.o: tests/test-c.c llama.h
-	$(CC) $(CFLAGS) -c $(filter-out %.h,$^) -o $@
+# target to generate assembly for a file
+src/common/sampling.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/common.dir/build.make CMakeFiles/common.dir/src/common/sampling.cpp.s
+.PHONY : src/common/sampling.cpp.s
 
-tests/test-backend-ops: tests/test-backend-ops.cpp ggml.o $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+src/common/train.o: src/common/train.cpp.o
+.PHONY : src/common/train.o
 
-tests/test-model-load-cancel: tests/test-model-load-cancel.cpp ggml.o llama.o tests/get-model.cpp $(COMMON_DEPS) $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+# target to build an object file
+src/common/train.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/common.dir/build.make CMakeFiles/common.dir/src/common/train.cpp.o
+.PHONY : src/common/train.cpp.o
 
-tests/test-autorelease: tests/test-autorelease.cpp ggml.o llama.o tests/get-model.cpp $(COMMON_DEPS) $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+src/common/train.i: src/common/train.cpp.i
+.PHONY : src/common/train.i
 
-tests/test-chat-template: tests/test-chat-template.cpp ggml.o llama.o $(COMMON_DEPS) $(OBJS)
-	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+# target to preprocess a source file
+src/common/train.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/common.dir/build.make CMakeFiles/common.dir/src/common/train.cpp.i
+.PHONY : src/common/train.cpp.i
+
+src/common/train.s: src/common/train.cpp.s
+.PHONY : src/common/train.s
+
+# target to generate assembly for a file
+src/common/train.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/common.dir/build.make CMakeFiles/common.dir/src/common/train.cpp.s
+.PHONY : src/common/train.cpp.s
+
+src/ggml-alloc.o: src/ggml-alloc.c.o
+.PHONY : src/ggml-alloc.o
+
+# target to build an object file
+src/ggml-alloc.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/ggml.dir/build.make CMakeFiles/ggml.dir/src/ggml-alloc.c.o
+.PHONY : src/ggml-alloc.c.o
+
+src/ggml-alloc.i: src/ggml-alloc.c.i
+.PHONY : src/ggml-alloc.i
+
+# target to preprocess a source file
+src/ggml-alloc.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/ggml.dir/build.make CMakeFiles/ggml.dir/src/ggml-alloc.c.i
+.PHONY : src/ggml-alloc.c.i
+
+src/ggml-alloc.s: src/ggml-alloc.c.s
+.PHONY : src/ggml-alloc.s
+
+# target to generate assembly for a file
+src/ggml-alloc.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/ggml.dir/build.make CMakeFiles/ggml.dir/src/ggml-alloc.c.s
+.PHONY : src/ggml-alloc.c.s
+
+src/ggml-backend.o: src/ggml-backend.c.o
+.PHONY : src/ggml-backend.o
+
+# target to build an object file
+src/ggml-backend.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/ggml.dir/build.make CMakeFiles/ggml.dir/src/ggml-backend.c.o
+.PHONY : src/ggml-backend.c.o
+
+src/ggml-backend.i: src/ggml-backend.c.i
+.PHONY : src/ggml-backend.i
+
+# target to preprocess a source file
+src/ggml-backend.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/ggml.dir/build.make CMakeFiles/ggml.dir/src/ggml-backend.c.i
+.PHONY : src/ggml-backend.c.i
+
+src/ggml-backend.s: src/ggml-backend.c.s
+.PHONY : src/ggml-backend.s
+
+# target to generate assembly for a file
+src/ggml-backend.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/ggml.dir/build.make CMakeFiles/ggml.dir/src/ggml-backend.c.s
+.PHONY : src/ggml-backend.c.s
+
+src/ggml-cuda.o: src/ggml-cuda.cu.o
+.PHONY : src/ggml-cuda.o
+
+# target to build an object file
+src/ggml-cuda.cu.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/ggml.dir/build.make CMakeFiles/ggml.dir/src/ggml-cuda.cu.o
+.PHONY : src/ggml-cuda.cu.o
+
+src/ggml-cuda.i: src/ggml-cuda.cu.i
+.PHONY : src/ggml-cuda.i
+
+# target to preprocess a source file
+src/ggml-cuda.cu.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/ggml.dir/build.make CMakeFiles/ggml.dir/src/ggml-cuda.cu.i
+.PHONY : src/ggml-cuda.cu.i
+
+src/ggml-cuda.s: src/ggml-cuda.cu.s
+.PHONY : src/ggml-cuda.s
+
+# target to generate assembly for a file
+src/ggml-cuda.cu.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/ggml.dir/build.make CMakeFiles/ggml.dir/src/ggml-cuda.cu.s
+.PHONY : src/ggml-cuda.cu.s
+
+src/ggml-quants.o: src/ggml-quants.c.o
+.PHONY : src/ggml-quants.o
+
+# target to build an object file
+src/ggml-quants.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/ggml.dir/build.make CMakeFiles/ggml.dir/src/ggml-quants.c.o
+.PHONY : src/ggml-quants.c.o
+
+src/ggml-quants.i: src/ggml-quants.c.i
+.PHONY : src/ggml-quants.i
+
+# target to preprocess a source file
+src/ggml-quants.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/ggml.dir/build.make CMakeFiles/ggml.dir/src/ggml-quants.c.i
+.PHONY : src/ggml-quants.c.i
+
+src/ggml-quants.s: src/ggml-quants.c.s
+.PHONY : src/ggml-quants.s
+
+# target to generate assembly for a file
+src/ggml-quants.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/ggml.dir/build.make CMakeFiles/ggml.dir/src/ggml-quants.c.s
+.PHONY : src/ggml-quants.c.s
+
+src/ggml.o: src/ggml.c.o
+.PHONY : src/ggml.o
+
+# target to build an object file
+src/ggml.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/ggml.dir/build.make CMakeFiles/ggml.dir/src/ggml.c.o
+.PHONY : src/ggml.c.o
+
+src/ggml.i: src/ggml.c.i
+.PHONY : src/ggml.i
+
+# target to preprocess a source file
+src/ggml.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/ggml.dir/build.make CMakeFiles/ggml.dir/src/ggml.c.i
+.PHONY : src/ggml.c.i
+
+src/ggml.s: src/ggml.c.s
+.PHONY : src/ggml.s
+
+# target to generate assembly for a file
+src/ggml.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/ggml.dir/build.make CMakeFiles/ggml.dir/src/ggml.c.s
+.PHONY : src/ggml.c.s
+
+src/llama.o: src/llama.cpp.o
+.PHONY : src/llama.o
+
+# target to build an object file
+src/llama.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/llama.dir/build.make CMakeFiles/llama.dir/src/llama.cpp.o
+.PHONY : src/llama.cpp.o
+
+src/llama.i: src/llama.cpp.i
+.PHONY : src/llama.i
+
+# target to preprocess a source file
+src/llama.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/llama.dir/build.make CMakeFiles/llama.dir/src/llama.cpp.i
+.PHONY : src/llama.cpp.i
+
+src/llama.s: src/llama.cpp.s
+.PHONY : src/llama.s
+
+# target to generate assembly for a file
+src/llama.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/llama.dir/build.make CMakeFiles/llama.dir/src/llama.cpp.s
+.PHONY : src/llama.cpp.s
+
+# Help Target
+help:
+	@echo "The following are some of the valid targets for this Makefile:"
+	@echo "... all (the default if no target is provided)"
+	@echo "... clean"
+	@echo "... depend"
+	@echo "... edit_cache"
+	@echo "... install"
+	@echo "... install/local"
+	@echo "... install/strip"
+	@echo "... list_install_components"
+	@echo "... rebuild_cache"
+	@echo "... binding"
+	@echo "... common"
+	@echo "... ggml"
+	@echo "... ggml_shared"
+	@echo "... ggml_static"
+	@echo "... llama"
+	@echo "... llama_shared"
+	@echo "... llama_static"
+	@echo "... server"
+	@echo "... src/common/common.o"
+	@echo "... src/common/common.i"
+	@echo "... src/common/common.s"
+	@echo "... src/common/console.o"
+	@echo "... src/common/console.i"
+	@echo "... src/common/console.s"
+	@echo "... src/common/grammar-parser.o"
+	@echo "... src/common/grammar-parser.i"
+	@echo "... src/common/grammar-parser.s"
+	@echo "... src/common/sampling.o"
+	@echo "... src/common/sampling.i"
+	@echo "... src/common/sampling.s"
+	@echo "... src/common/train.o"
+	@echo "... src/common/train.i"
+	@echo "... src/common/train.s"
+	@echo "... src/ggml-alloc.o"
+	@echo "... src/ggml-alloc.i"
+	@echo "... src/ggml-alloc.s"
+	@echo "... src/ggml-backend.o"
+	@echo "... src/ggml-backend.i"
+	@echo "... src/ggml-backend.s"
+	@echo "... src/ggml-cuda.o"
+	@echo "... src/ggml-cuda.i"
+	@echo "... src/ggml-cuda.s"
+	@echo "... src/ggml-quants.o"
+	@echo "... src/ggml-quants.i"
+	@echo "... src/ggml-quants.s"
+	@echo "... src/ggml.o"
+	@echo "... src/ggml.i"
+	@echo "... src/ggml.s"
+	@echo "... src/llama.o"
+	@echo "... src/llama.i"
+	@echo "... src/llama.s"
+.PHONY : help
+
+
+
+#=============================================================================
+# Special targets to cleanup operation of make.
+
+# Special rule to run CMake to check the build system integrity.
+# No rule that depends on this can have commands that come from listfiles
+# because they might be regenerated.
+cmake_check_build_system:
+	$(CMAKE_COMMAND) -S$(CMAKE_SOURCE_DIR) -B$(CMAKE_BINARY_DIR) --check-build-system CMakeFiles/Makefile.cmake 0
+.PHONY : cmake_check_build_system
+

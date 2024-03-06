@@ -289,8 +289,8 @@ if (LLAMA_CLBLAST)
     if (CLBlast_FOUND)
         message(STATUS "CLBlast found")
 
-        set(GGML_HEADERS_OPENCL ggml-opencl.h)
-        set(GGML_SOURCES_OPENCL ggml-opencl.cpp)
+        set(GGML_HEADERS_OPENCL src/ggml-opencl.h)
+        set(GGML_SOURCES_OPENCL src/ggml-opencl.cpp)
 
         add_compile_definitions(GGML_USE_CLBLAST)
 
